@@ -480,6 +480,29 @@ void runDircon(
   //trajopt.AddRunningCost(x_dot_right_hip.transpose()*S*x_dot_right_hip);//less useful
   //trajopt.AddRunningCost(x_dot_left_knee.transpose()*V*x_dot_left_knee);//less useful
   //trajopt.AddRunningCost(x_dot_right_knee.transpose()*U*x_dot_right_knee);//less useful
+  int n_v = 6;
+  int n_p = 6;
+  const double w_v_diff=1.0; 
+    for (int i = 0; i < 37; i++) 
+    {
+      auto v0 = trajopt.state(i).tail(n_v);
+      auto v1 = trajopt.state(i + 1).tail(n_v);
+      trajopt.AddCost(w_v_diff*(v0 - v1).dot(v0 - v1));
+    }
+    const double w_u_diff=1.0; 
+    if (w_u_diff) 
+    {
+      for (int i = 0; i < 37; i++) 
+      {
+        auto u0 = trajopt.input(i);
+        auto u1 = trajopt.input(i + 1);
+        trajopt.AddCost(w_u_diff * (u0 - u1).dot(u0 - u1));
+      }
+    }
+
+
+
+
   std::cout<< "trajopt.num_vars()after manually setting: "<<  trajopt.num_vars()<<std::endl;//??
   std::cout<< "trajopt.GetAllConstraints().size() after manually settingss:"<<  trajopt.GetAllConstraints().size()<<std::endl;//??
   std::cout<< "trajopt.GetAllCosts().size() after manually setting:"<<  trajopt.GetAllCosts().size()<<std::endl;//??   
@@ -1204,8 +1227,8 @@ int main(int argc, char* argv[])
    std::cout<<"init_time.size(): "<<init_time.size()<<std::endl;
    //random_x_search112_fixed_ankle.txt 与 random_u_search112_fixed_ankle.txt,用来人为指定那个随机初始化的值,即一个较好的随机值
    //u_planed_outsearch.txt与 x_planed_outsearch.txt为规划后的轨迹作为先验
-   int result1 = access("/home/cby/drake_learning/src/drake_learning2/src/priordata/random_x_search112_fixed_ankle.txtxxx", 0);//加入先验条件时,需要撤去文件名称的xxx
-   int result2 = access("/home/cby/drake_learning/src/drake_learning2/src/priordata/random_u_search112_fixed_ankle.txtxxx", 0);
+   int result1 = access("/home/cby/drake_learning/src/drake_learning2/src/priordata/random_x_search112_fixed_ankle.txt", 0);//加入先验条件时,需要撤去文件名称的xxx
+   int result2 = access("/home/cby/drake_learning/src/drake_learning2/src/priordata/random_u_search112_fixed_ankle.txt", 0);
    if(result1==0&&result2==0)
    {
       std::cout<<"exist prior files xu"<<std::endl;
