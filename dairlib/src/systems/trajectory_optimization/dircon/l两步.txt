@@ -1,0 +1,574 @@
+void runDircon(
+    std::unique_ptr<MultibodyPlant<T>> plant_ptr,
+    MultibodyPlant<double>* plant_double_ptr,
+    std::unique_ptr<SceneGraph<double>> scene_graph_ptr,
+    double stride_length,
+    double duration,
+    PiecewisePolynomial<double> init_x_traj,
+    PiecewisePolynomial<double> init_u_traj,
+    vector<PiecewisePolynomial<double>> init_l_traj,
+    vector<PiecewisePolynomial<double>> init_lc_traj,
+    vector<PiecewisePolynomial<double>> init_vc_traj) {
+ 
+  /*cout << "stride_length:" << " = " << stride_length << endl;//两相步长，半步步长
+  cout << "stride_duration:" << " = " << duration << endl;//两相时间，半步步长 
+    */
+  cout << "stride_length:" << " = " << stride_length << endl;//两相步长，半步步长
+  cout << "stride_duration:" << " = " << duration << endl;//两相时间，半步步长 
+  drake::systems::DiagramBuilder<double> builder;
+  
+  MultibodyPlant<T>& plant = *plant_ptr;//& 这里作为引用
+  SceneGraph<double>& scene_graph =
+      *builder.AddSystem(std::move(scene_graph_ptr));
+
+    /// Construct a map between joint names and position indices
+    ///     <name,index> such that q(index) has the given name 
+    /// return a map
+   auto positions_map = multibody::makeNameToPositionsMap(plant);
+   auto velocities_map = multibody::makeNameToVelocitiesMap(plant);
+//first = k, second = value
+ for (auto const& element : positions_map)
+    cout << "positions_map:" <<element.first << " = " << element.second << endl;
+  for (auto const& element : velocities_map)
+    cout << "velocities_map:"  << element.first << " = " << element.second << endl;
+
+    //红左蓝右，这里的frame是material frame，为该body的根坐标系，相当于ros中的父joint坐标系的位置。
+  const auto& left_lower_leg = plant.GetFrameByName("left_lower_leg");
+  const auto& right_lower_leg = plant.GetFrameByName("right_lower_leg");
+//pt_A the contact point on the body与地面接触的点
+  Vector3d pt(0, 0, -0.5);//足端点相对于关节膝关节joint的位置/问题是初始位置还是摆动位置，这两个位置相对与膝关节是一个位置，这是关于膝关节关节坐标系讲的
+  
+    double mu = 1;
+//左落足点相关计算类
+    //应当是计算落足点在世界坐标系下的位姿
+ auto left_foot_eval = multibody::WorldPointEvaluator<T>(plant, pt,
+      left_lower_leg, Matrix3d::Identity(), Vector3d::Zero(), {0, 2});//0 1 2对应xyz方向， 0 2 = x z
+  left_foot_eval.set_frictional(); //is_frictional_ = true; 
+  left_foot_eval.set_mu(mu);
+
+  auto right_foot_eval = multibody::WorldPointEvaluator<T>(plant, pt,
+      right_lower_leg, Matrix3d::Identity(), Vector3d::Zero(), {0, 2});
+  right_foot_eval.set_frictional();
+  right_foot_eval.set_mu(mu);
+    //printf("heredsds");    
+//运动学计算器的一个集合
+  auto evaluators_left = multibody::KinematicEvaluatorSet<T>(plant);
+  int left_foot_eval_index =  evaluators_left.add_evaluator(&left_foot_eval);
+  cout << "left_foot_eval_index:" << " = " << left_foot_eval_index << endl;//左足端点计算器的索引 0 
+  auto evaluators_right = multibody::KinematicEvaluatorSet<T>(plant);
+  int right_foot_eval_index =  evaluators_right.add_evaluator(&right_foot_eval);
+  cout << "left_foot_eval_index   000:" << " = " << left_foot_eval_index << endl;//右足端点计算器的索引 0 
+    
+    //printf("heredsds");
+  int num_knotpoints = 10;
+  double min_T = .1;//The minimum total duration of the mode (default 0)
+  double max_T = 3;
+//Each DirconMode object refers to a single hybrid mode of the optimization  
+  auto mode_left = DirconMode<T>(evaluators_left, num_knotpoints,
+      min_T, max_T);
+  mode_left.MakeConstraintRelative(0, 0);  // x-coordinate
+
+  auto mode_right = DirconMode<T>(evaluators_right, 2*num_knotpoints,
+      min_T, max_T);
+  mode_right.MakeConstraintRelative(0, 0);  // x-coordinate
+    
+    auto mode_left1 = DirconMode<T>(evaluators_left, num_knotpoints,
+      min_T, max_T);
+  mode_left1.MakeConstraintRelative(0, 0);  // x-coordinate
+
+  auto mode_right1 = DirconMode<T>(evaluators_right, num_knotpoints,
+      min_T, max_T);
+  mode_right1.MakeConstraintRelative(0, 0);  // x-coordinate
+
+    
+    //左足支撑相和右足支撑相
+  auto sequence = DirconModeSequence<T>(plant);
+  sequence.AddMode(&mode_left);
+  sequence.AddMode(&mode_right);
+  sequence.AddMode(&mode_left1);
+  //sequence.AddMode(&mode_right1);
+  auto trajopt = Dircon<T>(sequence);  
+//Adds a constraint on the total duration of the trajectory. 
+ /* trajopt.AddDurationBounds(duration, duration);//duration = 1*/
+ trajopt.AddDurationBounds(duration, duration);//duration = 2, 函数输入的地方乘了2，这里就不用了，即一个完成的步是两秒
+//set solver
+  trajopt.SetSolverOption(drake::solvers::SnoptSolver::id(),
+                           "Print file", "../snopt.out");
+  trajopt.SetSolverOption(drake::solvers::SnoptSolver::id(),
+                           "Major iterations limit", 400);//200
+//Set the initial guess for the trajectory decision variables. 
+  for (int j = 0; j < sequence.num_modes(); j++) {
+    cout << "num_modes:" << " = " << sequence.num_modes() << endl;//当前的modes数目 4
+    trajopt.drake::systems::trajectory_optimization::MultipleShooting::
+        SetInitialTrajectory(init_u_traj, init_x_traj);//40 knot points
+       /// Set the initial guess for the force variables for a specific mode
+        /// traj_init_l contact forces lambda (interpreted at knot points)
+         ///traj_init_lc contact forces (interpreted at collocation points)
+  /// traj_init_vc velocity constraint slack variables (at collocation)
+    trajopt.SetInitialForceTrajectory(j, init_l_traj[j], init_lc_traj[j],
+                                      init_vc_traj[j]);
+      cout << "trajopt.SetInitialForceTrajectory rows:" << " = " << init_l_traj[j].rows() << endl;//各个mode下约束力大小
+      cout << "trajopt.SetInitialForceTrajectory cols:" << " = " << init_l_traj[j].cols() << endl;//各个mode下约束力大小
+  }
+
+// Periodicity constraints
+// hip_pin = 3
+// left_knee_pin = 4
+// planar_roty = 2
+// planar_x = 0
+// planar_z = 1
+// right_knee_pin = 5
+//
+// hip_pindot = 3
+// left_knee_pindot = 4
+// planar_rotydot = 2
+// planar_xdot = 0
+// planar_zdot = 1
+// right_knee_pindot = 5
+//Returns the decision variables associated with the state, x, at the initial time index. 
+  auto x0 = trajopt.initial_state();
+//Returns the decision variables associated with the state, x, at the final time index. 
+  auto xf = trajopt.final_state();
+//起始状态中q和终止状态中q的约束    
+  trajopt.AddLinearConstraint(
+      x0(positions_map["planar_z"]) == xf(positions_map["planar_z"]));
+  //trajopt.AddLinearConstraint(x0(positions_map["hip_pin"]) +
+   //   x0(positions_map["planar_roty"]) == xf(positions_map["planar_roty"]));//原版的但这不是周期性的约束，反正目前不是，节点不明显
+  trajopt.AddLinearConstraint(x0(positions_map["hip_pin"])  == 0);
+  trajopt.AddLinearConstraint(x0(positions_map["planar_roty"])  == 0);//显示的约束半个步，一个步态，两种mode
+  
+  trajopt.AddLinearConstraint(x0(positions_map["left_knee_pin"])  == 0);
+  trajopt.AddLinearConstraint(x0(positions_map["right_knee_pin"])  == 0);//显示的约束半个步，一个步态，两种mode    
+    
+  trajopt.AddLinearConstraint(x0(positions_map["left_knee_pin"]) ==
+      xf(positions_map["right_knee_pin"]));
+  trajopt.AddLinearConstraint(x0(positions_map["right_knee_pin"]) ==
+      xf(positions_map["left_knee_pin"]));
+  trajopt.AddLinearConstraint(x0(positions_map["hip_pin"]) ==
+      -xf(positions_map["hip_pin"]));
+  trajopt.AddLinearConstraint(x0(positions_map["planar_roty"]) ==
+       -xf(positions_map["planar_roty"]));
+
+//起始状态中qdot和终止状态中qdot的约束    
+  int nq = plant.num_positions();//nq是q的个数（维度）对qdot的约束
+ /* trajopt.AddLinearConstraint(x0(nq + velocities_map["planar_zdot"]) ==
+                               xf(nq + velocities_map["planar_zdot"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["hip_pindot"]) +
+                               x0(nq + velocities_map["planar_rotydot"]) ==
+                               xf(nq + velocities_map["planar_rotydot"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["left_knee_pindot"]) ==
+                               xf(nq + velocities_map["right_knee_pindot"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["right_knee_pindot"]) ==
+                               xf(nq + velocities_map["left_knee_pindot"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["hip_pindot"]) ==
+                               -xf(nq + velocities_map["hip_pindot"]));*/
+    
+  trajopt.AddLinearConstraint(
+      x0(nq + velocities_map["planar_z"]) == xf(nq + velocities_map["planar_z"]));
+  //trajopt.AddLinearConstraint(nq + x0(velocities_map["hip_pin"]) +
+   //   x0(nq + velocities_map["planar_roty"]) == xf(nq + velocities_map["planar_roty"]));//原版的但这不是周期性的约束，反正目前不是，节点不明显
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["hip_pin"])  >= 0);
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["planar_roty"])  == 0);//显示的约束半个步，一个步态，两种mode
+  
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["left_knee_pin"])  == 0);
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["right_knee_pin"])  >= 0);//显示的约束半个步，一个步态，两种mode    
+    
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["left_knee_pin"]) ==
+      xf(nq + velocities_map["right_knee_pin"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["right_knee_pin"]) ==
+      xf(nq + velocities_map["left_knee_pin"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["hip_pin"]) ==
+      -xf(nq + velocities_map["hip_pin"]));
+  trajopt.AddLinearConstraint(x0(nq + velocities_map["planar_roty"]) ==
+       -xf(nq + velocities_map["planar_roty"]));
+
+
+    
+    
+  // // Knee joint limits关节位限
+  auto x = trajopt.state();
+  /*trajopt.AddConstraintToAllKnotPoints(x(positions_map["left_knee_pin"]) >= 0);
+  trajopt.AddConstraintToAllKnotPoints(
+      x(positions_map["right_knee_pin"]) >= 0);*/
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["left_knee_pin"]) >= -0.4);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["left_knee_pin"]) <= 0.4);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["right_knee_pin"]) >= -0.4);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["right_knee_pin"]) <= 0.4);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["planar_roty"]) >= -0.6);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["planar_roty"]) <= 0.6);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["hip_pin"]) >= -0.6);
+  trajopt.AddConstraintToAllKnotPoints(x(positions_map["hip_pin"]) <= 0.6);
+  
+  // stride length constraints步长，走一步，质点位移
+  trajopt.AddLinearConstraint(x0(positions_map["planar_x"]) == 0);
+  trajopt.AddLinearConstraint(xf(positions_map["planar_x"]) == 2*stride_length);
+// planarwalker trajopt.force_vars(0, i) 是3 对应lambda lambda_c gamma
+ for (int i = 0; i < 10; i++) {
+    trajopt.AddBoundingBoxConstraint(0, 0, trajopt.force_vars(0, i)(1));//force_vars是每个knot point处的力变量，
+      cout << "trajopt.force_vars(0, i)(1):" << " = " << trajopt.force_vars(0, i).size() << endl;//右足端点计算器的索引 0 
+    //trajopt.AddBoundingBoxConstraint(0, 0, trajopt.force_vars(1, i)(1));
+    //cout << "trajopt.force_vars(1, i)(1):" << " = " << trajopt.force_vars(1, i).size() << endl;//右足端点计算器的索引 0 
+     trajopt.AddBoundingBoxConstraint(0, 0, trajopt.force_vars(2, i)(1));
+    // trajopt.AddBoundingBoxConstraint(0, 0, trajopt.force_vars(3, i)(1));
+     cout << "trajopt.force_vars(2, i)(1):" << " = " << trajopt.force_vars(2, i).size() << endl;//右足端点计算器的索引 0 
+  }/**/
+ for (int i = 0; i < 20; i++) {
+    trajopt.AddBoundingBoxConstraint(0, 0, trajopt.force_vars(1, i)(1));
+    cout << "trajopt.force_vars(1, i)(1):" << " = " << trajopt.force_vars(1, i).size() << endl;//右足端点计算器的索引 0 
+  }/**/
+    //printf("here");
+  const double R = 10;  // Cost on input effort
+  auto u = trajopt.input();
+  const double M = 2;  // Cost on input effort    
+  const double N = 1;  // Cost on input effort    
+  auto theta_rk = x(positions_map["right_knee_pin"]);
+  auto theta_lk = x(positions_map["left_knee_pin"]);
+  auto theta_lh = x(positions_map["planar_roty"]);
+  auto theta_rh = x(positions_map["hip_pin"]);
+  std::cout << "Data type of theta_rk: "  <<typeid(theta_rk).name()<< std::endl; //i is the alias of int, c=char  
+  std::cout << "Data type of u: "  <<typeid(u).name()<< std::endl; //i is the alias of int, c=char  
+ //auto  cost_4xiang= u.transpose()*R*u+theta_rk*M*theta_rk+theta_lk*M*theta_lk+theta_lh*N*theta_lh+theta_rh*N*theta_rh;
+  trajopt.AddRunningCost(u.transpose()*R*u);
+    
+    
+  std::vector<unsigned int> visualizer_poses;
+  visualizer_poses.push_back(3);
+  visualizer_poses.push_back(3);
+  visualizer_poses.push_back(3);
+  //visualizer_poses.push_back(3);
+//std::cout << "222" << std::endl;//finding_path2 <<std::endl;//ourbot/v96_drake
+  trajopt.CreateVisualizationCallback(
+      drake::FindResourceOrThrow("drake/examples/PlanarWalker/PlanarWalker.urdf"),
+      visualizer_poses, 0.2, "base");//something happen here as i can't use FindResourceOrThrow from dairlib, please check here
+  //std::string finding_path2=dairlib::GetResourceSearchPaths();
+  //std::cout << "222" << std::endl;//finding_path2 <<std::endl;
+
+  auto start = std::chrono::high_resolution_clock::now();
+  const auto result = Solve(trajopt, trajopt.initial_guess());//规划器求解结果
+  auto finish = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> elapsed = finish - start;//求解时长
+  std::cout << "Solve time:" << elapsed.count() <<std::endl;
+  std::cout << "Cost:" << result.get_optimal_cost() <<std::endl;
+  std::cout << "herehere"  <<std::endl;
+  //std::cout << "1"  <<std::endl;
+  std::cout <<"result.is_success():"<<result.is_success()<<std::endl;
+  // visualizer
+    //GetStateAndDerivativeSamples这个函数存在维度错误
+  const drake::trajectories::PiecewisePolynomial<double> pp_xtraj =
+      trajopt.ReconstructStateTrajectory(result);
+  const drake::trajectories::PiecewisePolynomial<double> pp_utraj =
+      trajopt.ReconstructInputTrajectory(result);
+    //std::cout << "2"  <<std::endl;
+ multibody::connectTrajectoryVisualizer(plant_double_ptr,
+      &builder, &scene_graph, pp_xtraj);
+    //std::cout << "3"  <<std::endl;
+ auto diagram = builder.Build();
+    
+    /*testcode*/
+       int trajectory_time =  pp_utraj.end_time()-pp_utraj.start_time();
+    // auto trajectory_duration =  pp_utraj.duration(1);
+     //const std::vector<double>& trajectory_breaks=  pp_utraj.breaks();
+    std::cout << "trajectory_time:"  <<trajectory_time<<std::endl;
+    double times = 0.0;
+  /*  for(int m = 0; m<100;m++)
+    {
+        result_u.push_back(pp_utraj.value(times));
+        result_x.push_back(pp_xtraj.value(times));
+        times += 0.01;
+    }   */
+     for(int m = 0; m<200;m++)
+    {
+        result_u.push_back(pp_utraj.value(times));
+        result_x.push_back(pp_xtraj.value(times));
+        times += 0.01;
+    }
+    std::cout << "result_u.size():"  <<result_u.size()<<std::endl;//4*100      完整一步时是4*200
+    std::cout << "result_x.size():"  <<result_x.size()<<std::endl;//16*100    完整一步时是20*200
+    std::cout << "result_u[0].size():"  <<result_u[0].size()<<std::endl;
+    std::cout << "result_x[0].size():"  <<result_x[0].size()<<std::endl;
+     /*   for(int t = 0;t<100;t++)
+    {
+        std::cout << "result_x:hip_pin:"  <<result_x[t](3)<<std::endl;
+    } */  
+     /*   for(int t = 0;t<100;t++)
+    {  
+        std::cout << "result_x:left_knee_pin:"  <<result_x[t](4)<<std::endl;
+    }  */  
+      /*for(int t = 0;t<100;t++)
+    {
+        std::cout << "result_x:right_knee_pin:"  <<result_x[t](5)<<std::endl;
+    }*/
+    
+    /*    for(int t = 0;t<100;t++)
+    {
+        std::cout << "result_u:hip_pin:"  <<result_u[t](0)<<std::endl;
+    }  */
+      /*  for(int t = 0;t<100;t++)
+    {
+        std::cout << "result_u:left_knee_torque:"  <<result_u[t](1)<<std::endl;
+    }   */
+      /*   for(int t = 0;t<100;t++)
+    {
+        std::cout << "result_u:right_knee_pin:"  <<result_u[t](2)<<std::endl;
+    }     */
+   /*    for(int t = 0;t<100;t++)
+    {
+        std::cout << "result_u:hip_rpin:"  <<result_u[t](1)<<std::endl;
+    }  */
+    
+    
+    
+//std::cout << "4"  <<std::endl;
+  while (true) {
+      //std::cout << "5"  <<std::endl;
+    drake::systems::Simulator<double> simulator(*diagram);
+     // std::cout << "6"  <<std::endl;
+    simulator.set_target_realtime_rate(.5);
+      //std::cout << "7"  <<std::endl;
+    simulator.Initialize();
+      //std::cout << "8"  <<std::endl;
+    simulator.AdvanceTo(pp_xtraj.end_time());
+      //std::cout << "9"  <<std::endl;
+  }  /* I have build the project by meself through cmake and catkin_make*/
+}
+
+}  // namespace
+}  // namespace dairlib
+
+
+
+std::string get_greet(const std::string& who) {
+  return "Hello " + who;
+}
+
+void print_localtime() {
+  std::time_t result = std::time(nullptr);
+  std::cout << std::asctime(std::localtime(&result));
+}
+
+
+int main(int argc, char* argv[]) {
+
+  std::string words = get_greet("CBY");
+  std::cout <<words<<std::endl;
+  print_localtime();
+  
+  gflags::ParseCommandLineFlags(&argc, &argv, true);  
+  std::srand(time(0));  // Initialize random number generator.
+  //std::make_unique give a pointer to MultibodyPlant object
+  auto plant = std::make_unique<drake::multibody::MultibodyPlant<double>>(0.0);
+  auto plant_vis = std::make_unique<MultibodyPlant<double>>(0.0);
+  auto scene_graph = std::make_unique<SceneGraph<double>>();
+  //copyable_unique_ptr::get() Return a const pointer to the contained object if any, or nullptr. 
+  //parser is a parser object that parse the model files(urdf) and give the parsed model to a multiplant object (plant 
+  Parser parser(plant.get()); //give the object Multiplant to the parser
+  //parser_vis also a parser object that parse the model files(urdf) and give the parsed model to a multiplant object (plant_vis) 
+  //and scene_graph 
+  Parser parser_vis(plant_vis.get(), scene_graph.get()); //ourbot/v96_drake
+  std::string full_name = drake::FindResourceOrThrow("drake/examples/PlanarWalker/PlanarWalker.urdf");
+  std::string our_urdf_path = "/opt/drake/share/drake/examples";
+  std::cout << "please add our model here:" << our_urdf_path <<"\n"<<std::endl;    
+  std::cout << "we have PlanarWalker now!"  <<"\n"<<std::endl;    
+  //Parses the SDF or URDF file named in arguement and adds one model to plant. 
+  parser.AddModelFromFile(full_name);
+  parser_vis.AddModelFromFile(full_name);
+
+    //modelindex
+    auto num_model_index = plant->num_model_instances();
+    std::cout << "1. PlanarWalker has "  << num_model_index << " num_model_index"<<std::endl;  
+    for (ModelInstanceIndex i(0); i<num_model_index;i++){
+        const std::string&  ModelInstance_name = plant->GetModelInstanceName(i);
+        ModelInstanceIndex  ModelInstance = plant->GetModelInstanceByName(ModelInstance_name);
+        std::cout << "\t model_name:"  <<ModelInstance_name<< std::endl; 
+        bool yes=plant->HasModelInstanceNamed("KneedCompassGait");
+        std::cout << "\t model_index"<< ModelInstance_name <<"PlanarWalker has been installed ?: "  <<yes<< std::endl; 
+    }
+    
+    //joints 11
+    auto num_joints = plant->num_joints();
+  std::cout << "2. PlanarWalker has "  << num_joints << " Joints"<<std::endl;  
+   for(JointIndex i(0); i<num_joints;i++)
+   {
+       const drake::multibody::Joint<double>&  joint = plant->get_joint(i);
+       std::cout << "\tJoints:"  <<joint.name()<< std::endl;         
+   }
+    
+    //frames 24(12+12未知)
+    auto num_frames = plant->num_frames();
+    //前12个是每个link算一个
+  std::cout << "3. PlanarWalker has "  << num_frames << " frames"<<std::endl;  
+   for(FrameIndex i(0); i<plant->num_frames();i++)
+   {
+       const drake::multibody::Frame<double>& each_frame= plant->get_frame(i);
+       std::cout << "\tFrame:"  <<each_frame.name()<< std::endl;  
+   }
+  
+  //base相当于一个地板(基座)，固定在世界坐标系下
+  //将地板(基座) 与世界坐标系合一
+  plant->WeldFrames(
+      plant->world_frame(), plant->GetFrameByName("base"),
+      drake::math::RigidTransform<double>());
+  plant_vis->WeldFrames(
+      plant_vis->world_frame(), plant_vis->GetFrameByName("base"),
+      drake::math::RigidTransform<double>());  
+  
+  plant->Finalize();
+  plant_vis->Finalize();
+    
+  //state q+q_dot and initialize to 0
+  Eigen::VectorXd x0 = Eigen::VectorXd::Zero(plant->num_positions() +
+                       plant->num_velocities());  
+    
+  std::cout << "State dimensions: "  << (plant->num_positions() + plant->num_velocities()) <<std::endl;  
+        
+  //GRF information 地面接触力，xyz三个方向 
+    //一个初始向量，给力初始samples用的
+  Eigen::VectorXd init_l_vec(3);
+  init_l_vec << 0, 0, 20*9.81;//20质量 lammda
+    
+    //actuators information, lh,rh,lk,rk 
+  int nu = plant->num_actuators();
+  std::cout << "Actuators num: "  << nu <<std::endl;  
+  for (JointActuatorIndex i(0); i<nu;i++){
+        const JointActuator<double>&  joint_actuators = plant->get_joint_actuator(i);
+        std::cout << "\t actuator_index:"  <<i<< std::endl; 
+        std::cout << "\t actuator_name:"  <<joint_actuators.name()<< std::endl; 
+        const drake::multibody::Joint<double>&  actuator_joint = (plant->get_joint_actuator(i)).joint();
+        std::cout << "\t joint_name:"  <<actuator_joint.name()<< std::endl; 
+    }
+    
+  //dimensions of state    
+  int nx = plant->num_positions() + plant->num_velocities();//20
+
+  int N = 10;
+  int i;
+    
+    //矩阵向量
+  //初始的状态啊轨迹和输入轨迹
+  std::vector<MatrixXd> init_x;
+  std::vector<MatrixXd> init_u;
+   //declare a vector and each content is a PiecewisePolynomial
+  std::vector<PiecewisePolynomial<double>> init_l_traj;//地面接触力，xyz三个方向 traj_init_l contact forces lambda (interpreted at knot points)
+  std::vector<PiecewisePolynomial<double>> init_lc_traj;//traj_init_lc contact forces (interpreted at collocation points)
+  std::vector<PiecewisePolynomial<double>> init_vc_traj;  //traj_init_vc velocity constraint slack variables (at collocation)
+     // std::cout << "Data type of init_vc_traj: "  <<typeid(init_vc_traj).name()<< std::endl; //i is the alias of int, c=char
+  // Initialize state trajectory 0-19:20个值
+    //定义break points and knot points. N.B. 这二十个点是两个mode组成的sequence的完整体
+  std::vector<double> init_time;
+ /* for (int i = 0; i < 2*N-1; i++) {
+    init_time.push_back(i*.2);//初始的时间间隔，也就是每一个knotpoint对应的时间0.0，0.2，0.4...
+    init_x.push_back(x0 + .1*VectorXd::Random(nx));//初始状态轨迹在knotpoint上的值x[i]
+    init_u.push_back(VectorXd::Random(nu));//u[i]
+  }*/
+    //设计完整的一步周期.4的话是一步半
+  for (int i = 0; i < 4*N-1; i++) {
+    init_time.push_back(i*.2);//初始的时间间隔，也就是每一个knotpoint对应的时间0.0，0.2，0.4...
+    init_x.push_back(x0 + .1*VectorXd::Random(nx));//初始状态轨迹在knotpoint上的值x[i]
+    init_u.push_back(VectorXd::Random(nu));//u[i]
+  }
+
+    
+  std::cout << "the initial time sequence(break points) and x init trajectory and u init trajectory (knot points on x(t), u(t) )has set."<<std::endl;
+    //ZeroOrderHold零阶多项式，就是一个y=n， constant function
+    //由breaks 和 konts 生成初始轨迹，都是恒定值，常量函数，初始空间和驱动空间的轨迹，20维的轨迹束,一个单一的轨迹束，具有多个维度
+  auto init_x_traj = PiecewisePolynomial<double>::ZeroOrderHold(init_time, init_x);
+  auto init_u_traj = PiecewisePolynomial<double>::ZeroOrderHold(init_time, init_u);
+  //std::cout << "Data type of init_x_traj: "  <<typeid(init_x_traj).name()<< std::endl; //i is the alias of int, c=char
+  //Initialize force trajectories
+   //两种mode？是的,相当于上述定义状态初始轨迹和输入初始轨迹的一半时长，即单一mode
+/*  for (int j = 0; j < 2; j++) {    
+    std::vector<MatrixXd> init_l_j;//samples
+    std::vector<MatrixXd> init_lc_j;//samples
+    std::vector<MatrixXd> init_vc_j;//samples
+    std::vector<double> init_time_j;//breaks
+    for (int i = 0; i < N; i++) {
+      init_time_j.push_back(i*.2);
+      init_l_j.push_back(init_l_vec);//0 0 20*9.81
+      init_lc_j.push_back(init_l_vec);//0 0 20*9.81
+      init_vc_j.push_back(VectorXd::Zero(3));//000
+     // std::cout << "init_time_j "  <<i<<std::endl;  //两段0.0--1.8 0-9
+    }
+
+   //零阶力轨迹 生成轨迹
+  // traj_init_l contact forces λ  (interpreted at knot points)
+  //traj_init_lc contact λ'  (interpreted at collocation points)
+  /// traj_init_vc velocity constraint slack variables  γ (at collocation)
+    auto init_l_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_l_j);
+    auto init_lc_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_lc_j);
+    auto init_vc_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_vc_j);
+    //三维的轨迹束，共两段，两个多维的轨迹放在一个向量里
+    init_l_traj.push_back(init_l_traj_j);//两个mode下，各十段，共二十段，广义力
+    init_lc_traj.push_back(init_lc_traj_j);//两个mode下，各十段，共二十段，驱动力
+    init_vc_traj.push_back(init_vc_traj_j);//两个mode下，各十段，共二十段，速度相关的科式力
+      //初始情况下两种mode的force轨迹相同
+  }*/
+    
+  //半步是两相，即一支脚的终点是另一只脚的起点，一步应是四相，但是是3modes（仍将视为四个，一对一），一只脚的终点和该脚起点一致，每一相10个knotpoint，共四十个points
+  for (int j = 0; j < 4; j++) {    
+    std::vector<MatrixXd> init_l_j;//samples
+    std::vector<MatrixXd> init_lc_j;//samples
+    std::vector<MatrixXd> init_vc_j;//samples
+    std::vector<double> init_time_j;//breaks
+    if((j==0)||(j==3)){
+      for (int i = 0; i < N; i++) {
+          init_time_j.push_back(i*.2);
+          init_l_j.push_back(init_l_vec);//0 0 20*9.81
+          init_lc_j.push_back(init_l_vec);//0 0 20*9.81
+          init_vc_j.push_back(VectorXd::Zero(3));//000
+         //std::cout << "init_time_j "  <<i<<std::endl;  //第1段-第2段1.0--2.8 每段0-9
+        }
+       //零阶力轨迹 生成轨迹
+      // traj_init_l contact forces λ  (interpreted at knot points)
+      //traj_init_lc contact λ'  (interpreted at collocation points)
+      /// traj_init_vc velocity constraint slack variables  γ (at collocation)
+      auto init_l_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_l_j);
+      auto init_lc_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_lc_j);
+      auto init_vc_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_vc_j);
+      //三维的轨迹束，共4段，4个多维的轨迹放在一个向量里
+      init_l_traj.push_back(init_l_traj_j);
+      init_lc_traj.push_back(init_lc_traj_j);
+      init_vc_traj.push_back(init_vc_traj_j);
+      //初始情况下两种mode的force轨迹相同
+      }
+    else if(j==1){
+       for (int i = 0; i < 2*N; i++) {
+          init_time_j.push_back(i*.2);
+          init_l_j.push_back(init_l_vec);//0 0 20*9.81
+          init_lc_j.push_back(init_l_vec);//0 0 20*9.81
+          init_vc_j.push_back(VectorXd::Zero(3));//000
+         //std::cout << "init_time_j "  <<i<<std::endl;  //第1段-第2段1.0--2.8 每段0-9
+        }
+       //零阶力轨迹 生成轨迹
+      // traj_init_l contact forces λ  (interpreted at knot points)
+      //traj_init_lc contact λ'  (interpreted at collocation points)
+      /// traj_init_vc velocity constraint slack variables  γ (at collocation)
+      auto init_l_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_l_j);
+      auto init_lc_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_lc_j);
+      auto init_vc_traj_j = PiecewisePolynomial<double>::ZeroOrderHold(init_time_j,init_vc_j);
+      //三维的轨迹束，共4段，4个多维的轨迹放在一个向量里
+      init_l_traj.push_back(init_l_traj_j);
+      init_lc_traj.push_back(init_lc_traj_j);
+      init_vc_traj.push_back(init_vc_traj_j);
+      //初始情况下两种mode的force轨迹相同
+      }
+    else if(j=2)
+      {
+      }   
+    }
+ std::cout << "init_l_traj.size() "  << init_l_traj.size()<<std::endl;  //3段，3个mode，10-20-10 40个knot points ||4段了，4个mode, 中间那个mode 分为两段考虑
+ std::cout << "each segment has 10 knot "  << init_l_traj.size()<<std::endl; 
+    if (FLAGS_autodiff) {
+    std::unique_ptr<MultibodyPlant<drake::AutoDiffXd>> plant_autodiff =
+        drake::systems::System<double>::ToAutoDiffXd(*plant);
+    dairlib::runDircon<drake::AutoDiffXd>(
+      std::move(plant_autodiff), plant_vis.get(), std::move(scene_graph),
+      FLAGS_strideLength, FLAGS_duration, init_x_traj, init_u_traj, init_l_traj,
+      init_lc_traj, init_vc_traj);
+  } else {
+        //std::move 将对象变为可完全操控体 FLAGS_duration = 1 FLAGS_strideLength = 0.1
+    dairlib::runDircon<double>(
+      std::move(plant), plant_vis.get(), std::move(scene_graph),
+      2*FLAGS_strideLength, 2*FLAGS_duration, init_x_traj, init_u_traj, init_l_traj,
+      init_lc_traj, init_vc_traj);
+  } 
+}

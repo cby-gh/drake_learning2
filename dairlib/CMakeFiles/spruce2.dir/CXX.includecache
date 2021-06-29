@@ -1,0 +1,38 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/cby/drake_learning/src/drake_learning2/dairlib/src/third_party/spruce/spruce.cc
+spruce.hh
+/home/cby/drake_learning/src/drake_learning2/dairlib/src/third_party/spruce/spruce.hh
+utility
+-
+algorithm
+-
+fstream
+-
+sstream
+-
+cstdio
+-
+sys/stat.h
+-
+direct.h
+-
+sys/types.h
+-
+unistd.h
+-
+
+include/third_party/spruce/spruce.hh
+vector
+-
+iostream
+-
+string
+-
+
